@@ -1,395 +1,322 @@
-# main.py
-# Clean, robust Telegram downloader bot (TXT -> PDF / Video)
-# Features: yt-dlp with headers, ffmpeg fallback for m3u8 (Akamai), PDF support, thumbnails, safe filenames.
+# Don't Remove Credit Tg - https://t.me/roxybasicneedbot1
+# Subscribe YouTube Channel For Amazing Bot https://youtube.com/@roxybasicneedbot
+# Ask Doubt on telegram https://t.me/roxybasicneedbot1
 
 import os
 import re
 import sys
+import json
 import time
 import asyncio
-import shlex
-import logging
-from pathlib import Path
-from subprocess import PIPE
+import requests
+import subprocess
+
+import core as helper
+from utils import progress_bar
+from vars import API_ID, API_HASH, BOT_TOKEN, FORCE_SUB_CHANNEL, FORCE_SUB_CHANNEL_LINK, ADMINS, OWNER_ID
+from aiohttp import ClientSession
+from pyromod import listen
+from subprocess import getstatusoutput
 
 from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import Message
+from pyrogram.errors import FloodWait, ChatAdminRequired
+from pyrogram.errors.exceptions.bad_request_400 import StickerEmojiInvalid
+from pyrogram.types.messages_and_media import message
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 from pyrogram.enums import ParseMode
 
-# ---------- Config (edit vars.py to set) ----------
-# It's expected you have vars.py with API_ID, API_HASH, BOT_TOKEN
-try:
-    from vars import API_ID, API_HASH, BOT_TOKEN
-except Exception:
-    print("Missing vars.py with API_ID, API_HASH, BOT_TOKEN. Exiting.")
-    sys.exit(1)
+bot = Client(
+    "bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN)
 
-# ---------- Settings ----------
-DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "/opt/render/project/src/downloads")
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+# Welcome image file path
+WELCOME_IMAGE_PATH = "welcome.jpg"
 
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(message)s")
+# Enhanced URL validation function
+def is_valid_url(url):
+    """Check if URL is valid and accessible"""
+    url_pattern = re.compile(
+        r'^https?://'  # http:// or https://
+        r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+[A-Z]{2,6}\.?|'  # domain...
+        r'localhost|'  # localhost...
+        r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'  # ...or ip
+        r'(?::\d+)?'  # optional port
+        r'(?:/?|[/?]\S+)$', re.IGNORECASE)
+    return url_pattern.match(url) is not None
 
-# default headers used for yt-dlp and ffmpeg (to mimic browser)
-DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-    "Accept": "*/*",
-    "Connection": "keep-alive"
-}
+def extract_url_from_line(line):
+    """Extract and validate URL from a line of text"""
+    line = line.strip()
+    if not line:
+        return None, None
 
-# Limits
-MIN_VIDEO_BYTES = 120_000        # treat smaller as failed (120 KB)
-PDF_LIMIT_BYTES = 49 * 1024 * 1024  # 49 MB safe limit
+    # Try to find URL in the line
+    url_match = re.search(r'https?://[^\s]+', line)
+    if url_match:
+        url = url_match.group()
+        # Extract title (everything before the URL)
+        title = line.replace(url, '').strip()
+        if not title:
+            title = f"File_{hash(url) % 1000}"
+        return title, url
 
-# ---------- Bot init ----------
-bot = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+    # If line doesn't contain http/https, check if it's a valid domain
+    if '.' in line and not line.startswith('/'):
+        # Assume it's a URL without protocol
+        url = 'https://' + line
+        if is_valid_url(url):
+            return f"File_{hash(line) % 1000}", url
 
-# ---------- Utilities ----------
-def safe_filename(name: str, max_len: int = 80) -> str:
-    name = re.sub(r'[<>:"/\\|?*\n\r]+', "_", name).strip()
-    if len(name) > max_len:
-        name = name[:max_len].rsplit(" ", 1)[0]
-    name = name.strip(" ._")
-    return name or "file"
+    return None, None
 
-def path_for(name: str, ext: str):
-    return os.path.join(DOWNLOAD_DIR, f"{name}{ext}")
+@bot.on_message(filters.command(["start"]))
+async def start(bot: Client, m: Message):
+    welcome_text = f"<b>ðŸ‘‹ Hello {m.from_user.mention}!</b>\n\n<blockquote>ðŸ“ I am a bot for downloading files from your <b>.TXT</b> file and uploading them to Telegram.\n\nðŸš€ To get started, send /upload command and follow the steps.</blockquote>"
 
-def build_yt_dlp_headers(url: str) -> str:
-    # Build --add-header args for yt-dlp
-    host = ""
+    # Create inline keyboard
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("âš¡ Upload Files", callback_data="upload_files")
+        ],
+        [
+            InlineKeyboardButton("ðŸ”” Channel", url="https://t.me/class_video_pdf"),
+            InlineKeyboardButton("ðŸ‘¨â€ðŸ’» Developer", url="https://t.me/class_video_pdf")
+        ]
+    ])
+
+    # Check if the welcome image file exists
+    if os.path.exists(WELCOME_IMAGE_PATH):
+        await m.reply_photo(
+            photo=WELCOME_IMAGE_PATH,
+            caption=welcome_text,
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        await m.reply_text(
+            welcome_text,
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML
+        )
+
+@bot.on_callback_query()
+async def callback_handler(bot: Client, query: CallbackQuery):
+    data = query.data
+
+    # We removed any force-subscribe/refresh logic.
+    if data == "upload_files":
+        await query.answer("Send /upload command to start!", show_alert=True)
+    else:
+        # For any other callback, just acknowledge
+        await query.answer()
+
+@bot.on_message(filters.command("stop"))
+async def restart_handler(_, m):
+    await m.reply_text("**ðŸ›‘ Stopped**", True)
+    os.execl(sys.executable, sys.executable, *sys.argv)
+
+@bot.on_message(filters.command(["upload"]))
+async def upload(bot: Client, m: Message):
+    editable = await m.reply_text('ðŸ“¤ Send your TXT file with links âš¡ï¸')
+    input: Message = await bot.listen(editable.chat.id)
+    x = await input.download()
+    await input.delete(True)
+
+    path = f"./downloads/{m.chat.id}"
+    os.makedirs(path, exist_ok=True)
+
     try:
-        host = url.split("/")[2]
-    except:
-        host = ""
-    headers = {
-        **DEFAULT_HEADERS,
-        "Referer": url,
+        with open(x, "r", encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+
+        lines = content.split("\n")
+        links = []
+
+        for line in lines:
+            title, url = extract_url_from_line(line)
+            if title and url and is_valid_url(url):
+                links.append([title, url])
+
+        os.remove(x)
+
+        if not links:
+            await editable.edit("âŒ **No valid links found in the file!**\n\nPlease make sure your file contains valid URLs.")
+            return
+
+    except Exception as e:
+        await editable.edit(f"âŒ **Error reading file:** {str(e)}")
+        if os.path.exists(x):
+            os.remove(x)
+        return
+
+    await editable.edit(f"ðŸ“Š **Total Links Found:** {len(links)}\n\nðŸ“ **Send starting number** (default: 1)")
+    input0: Message = await bot.listen(editable.chat.id)
+    raw_text = input0.text
+    await input0.delete(True)
+
+    await editable.edit("ðŸ“ **Enter your batch name:**")
+    input1: Message = await bot.listen(editable.chat.id)
+    raw_text0 = input1.text
+    await input1.delete(True)
+
+    await editable.edit("ðŸŽ¬ **Select video quality:**\n\n144, 240, 360, 480, 720, 1080")
+    input2: Message = await bot.listen(editable.chat.id)
+    raw_text2 = input2.text
+    await input2.delete(True)
+
+    quality_map = {
+        "144": "256x144", "240": "426x240", "360": "640x360",
+        "480": "854x480", "720": "1280x720", "1080": "1920x1080"
     }
-    if host:
-        headers["Origin"] = f"https://{host}"
-    parts = []
-    for k, v in headers.items():
-        parts.append(f'--add-header "{k}: {v}"')
-    return " ".join(parts)
+    res = quality_map.get(raw_text2, "UN")
 
-def build_ffmpeg_header_args(url: str) -> str:
-    # ffmpeg needs multiple -headers "Key: Value\r\n"
-    headers = {
-        **DEFAULT_HEADERS,
-        "Referer": url
-    }
-    header_lines = "".join([f"{k}: {v}\r\n" for k, v in headers.items()])
-    # ffmpeg CLI uses single -headers argument
-    return shlex.quote(header_lines)
+    await editable.edit("ðŸ’¬ **Enter caption for files:**")
+    input3: Message = await bot.listen(editable.chat.id)
+    raw_text3 = input3.text
+    await input3.delete(True)
+    MR = raw_text3
 
-async def run_subprocess(cmd: str, timeout: int = 900):
-    """
-    Run a shell command asynchronously and return (returncode, stdout, stderr)
-    """
-    logging.info("Running shell command: %s", cmd if len(cmd) < 400 else cmd[:400] + " ...")
-    proc = await asyncio.create_subprocess_shell(cmd, stdout=PIPE, stderr=PIPE)
+    await editable.edit("ðŸ–¼ **Send thumbnail URL** (or send 'no' to skip):")
+    input6 = await bot.listen(editable.chat.id)
+    thumb_input = input6.text
+    await input6.delete(True)
+    await editable.delete()
+
+    thumb = "no"
+    if thumb_input and thumb_input.startswith(("http://", "https://")):
+        try:
+            getstatusoutput(f"wget '{thumb_input}' -O 'thumb.jpg'")
+            if os.path.exists('thumb.jpg'):
+                thumb = "thumb.jpg"
+        except:
+            thumb = "no"
+
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        return -1, b"", b"Timeout"
-    return proc.returncode, stdout, stderr
-
-def file_ok(path: str, min_bytes: int = MIN_VIDEO_BYTES) -> bool:
-    try:
-        st = os.path.getsize(path)
-        return st >= min_bytes
+        count = max(1, int(raw_text)) if raw_text and raw_text.isdigit() else 1
     except:
-        return False
+        count = 1
 
-# ---------- Download Handlers ----------
+    successful_downloads = 0
+    failed_downloads = 0
 
-async def download_pdf(url: str, outname: str) -> str | None:
-    """
-    Try download PDF using requests streaming (with headers) or yt-dlp fallback.
-    Returns path or None.
-    """
-    outpath = path_for(outname, ".pdf")
-    headers = {**DEFAULT_HEADERS, "Referer": url}
     try:
-        import requests
-        with requests.get(url, headers=headers, stream=True, timeout=30) as r:
-            r.raise_for_status()
-            with open(outpath, "wb") as f:
-                for chunk in r.iter_content(chunk_size=65536):
-                    if chunk:
-                        f.write(chunk)
-        if os.path.exists(outpath) and os.path.getsize(outpath) > 1000:
-            return outpath
-    except Exception as e:
-        logging.warning("requests PDF download failed: %s", e)
+        for i in range(count - 1, len(links)):
+            if i >= len(links):
+                break
 
-    # fallback to yt-dlp
-    ythead = build_yt_dlp_headers(url)
-    cmd = f'yt-dlp {ythead} -o "{outpath}" "{url}" --no-check-certificate'
-    rc, out, err = await run_subprocess(cmd, timeout=300)
-    if rc == 0 and os.path.exists(outpath):
-        return outpath
-    # failed
-    if os.path.exists(outpath):
-        try:
-            os.remove(outpath)
-        except:
-            pass
-    return None
+            try:
+                title, url = links[i]
 
-async def download_with_ytdlp(url: str, out_basename: str) -> str | None:
-    """
-    Try yt-dlp first with headers. Return downloaded filepath or None.
-    """
-    ythead = build_yt_dlp_headers(url)
-    out_template = os.path.join(DOWNLOAD_DIR, f"{out_basename}.%(ext)s")
-    cmd = f'yt-dlp {ythead} -f "best" -o "{out_template}" "{url}" --no-check-certificate'
-    rc, out, err = await run_subprocess(cmd, timeout=900)
-    # try to locate the file produced
-    # yt-dlp may produce .mp4/.mkv/.webm etc.
-    for ext in [".mp4", ".mkv", ".webm", ".mov", ".avi", ".ts"]:
-        candidate = os.path.join(DOWNLOAD_DIR, f"{out_basename}{ext}")
-        if os.path.exists(candidate) and file_ok(candidate):
-            return candidate
-    # sometimes yt-dlp writes with different ext; search by prefix
-    for f in os.listdir(DOWNLOAD_DIR):
-        if f.startswith(out_basename + "."):
-            candidate = os.path.join(DOWNLOAD_DIR, f)
-            if os.path.exists(candidate) and file_ok(candidate):
-                return candidate
-    logging.warning("yt-dlp did not produce a valid file for %s (rc=%s)", url, rc)
-    return None
+                # Process URL for different platforms
+                if "drive.google.com" in url:
+                    url = url.replace("file/d/","uc?export=download&id=").replace("/view?usp=sharing","")
+                elif "youtube.com/watch" in url or "youtu.be/" in url:
+                    pass  # Keep as is for yt-dlp
+                elif "visionias" in url:
+                    try:
+                        async with ClientSession() as session:
+                            headers = {
+                                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                            }
+                            async with session.get(url, headers=headers) as resp:
+                                text = await resp.text()
+                                m3u8_match = re.search(r"(https://.*?playlist\.m3u8.*?)\"", text)
+                                if m3u8_match:
+                                    url = m3u8_match.group(1)
+                    except:
+                        pass
 
-async def download_with_ffmpeg(url: str, out_basename: str) -> str | None:
-    """
-    Fallback using ffmpeg directly for m3u8/HLS or plain streams.
-    """
-    out_path = path_for(out_basename, ".mp4")
-    header_lines = build_ffmpeg_header_args(url)  # already quoted
-    # ffmpeg -headers "<headers>" -i "URL" -c copy out.mp4
-    cmd = f'ffmpeg -y -headers {header_lines} -i "{url}" -c copy "{out_path}"'
-    rc, out, err = await run_subprocess(cmd, timeout=1800)
-    if rc == 0 and os.path.exists(out_path) and file_ok(out_path):
-        return out_path
-    # try with re-encoding if copy failed (sometimes necessary)
-    cmd2 = f'ffmpeg -y -headers {header_lines} -i "{url}" -c:v libx264 -c:a aac -strict -2 "{out_path}"'
-    rc2, out2, err2 = await run_subprocess(cmd2, timeout=1800)
-    if rc2 == 0 and os.path.exists(out_path) and file_ok(out_path):
-        return out_path
-    if os.path.exists(out_path):
-        try:
-            os.remove(out_path)
-        except:
-            pass
-    logging.warning("ffmpeg failed for %s (rcs %s,%s)", url, rc, rc2 if 'rc2' in locals() else None)
-    return None
+                name1 = re.sub(r'[<>:"/\\|?*]', '', title)[:50]
+                name = f'{str(count).zfill(3)}) {name1}'
 
-async def download_video(url: str, out_basename: str) -> str | None:
-    """
-    Best-effort video downloader:
-      1) yt-dlp with headers
-      2) if fails -> ffmpeg (headers)
-    Returns downloaded file path or None.
-    """
-    # 1) yt-dlp
-    try:
-        path = await download_with_ytdlp(url, out_basename)
-        if path:
-            logging.info("yt-dlp succeeded: %s", path)
-            return path
-    except Exception as e:
-        logging.exception("yt-dlp crashed: %s", e)
-
-    # 2) ffmpeg fallback
-    try:
-        path = await download_with_ffmpeg(url, out_basename)
-        if path:
-            logging.info("ffmpeg succeeded: %s", path)
-            return path
-    except Exception as e:
-        logging.exception("ffmpeg crashed: %s", e)
-
-    return None
-
-# ---------- Telegram send helpers ----------
-async def send_file_to_chat(chat_id: int, path: str, caption: str = "", thumb: str | None = None):
-    """
-    Send video or document depending on extension.
-    """
-    try:
-        if path.lower().endswith(".pdf"):
-            await bot.send_document(chat_id, document=path, caption=caption)
-        else:
-            # For big videos use send_video (supports streaming)
-            await bot.send_video(chat_id, video=path, caption=caption, supports_streaming=True, thumb=thumb if thumb and os.path.exists(thumb) else None)
-    except Exception as e:
-        logging.exception("Failed to send file: %s", e)
-        # attempt as document if send_video fails
-        try:
-            await bot.send_document(chat_id, document=path, caption=caption)
-        except Exception as e2:
-            logging.exception("Fallback send_document failed: %s", e2)
-
-# ---------- Bot commands ----------
-@bot.on_message(filters.command("start"))
-async def start_cmd(client: Client, message: Message):
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Upload .TXT", callback_data="upload_files")]])
-    text = "<b>Hi! Send /upload and upload a .txt file with one link per line (video/pdf)</b>"
-    await message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
-
-@bot.on_callback_query(filters.regex(r"upload_files"))
-async def cb_upload(_, query):
-    await query.answer("Send /upload to start!", show_alert=True)
-
-@bot.on_message(filters.command("upload"))
-async def upload_cmd(client: Client, message: Message):
-    prompt = await message.reply_text("📤 Send your .TXT file with links (one per line).")
-    try:
-        file_msg = await bot.listen(chat_id=message.chat.id, timeout=120)
-    except Exception:
-        await prompt.edit_text("❌ Timeout waiting for file.")
-        return
-
-    if not file_msg or not file_msg.document:
-        await prompt.edit_text("❌ Please send a document (.txt).")
-        return
-
-    # download the txt
-    downloaded = await file_msg.download()
-    try:
-        with open(downloaded, "r", encoding="utf-8", errors="ignore") as f:
-            lines = [l.strip() for l in f.read().splitlines() if l.strip()]
-    finally:
-        try:
-            os.remove(downloaded)
-        except:
-            pass
-
-    if not lines:
-        await prompt.edit_text("❌ File empty or no links found.")
-        return
-
-    await prompt.edit_text(f"📊 Found {len(lines)} links. Send starting index (1 for first).")
-    try:
-        idx_msg = await bot.listen(chat_id=message.chat.id, timeout=60)
-        start_idx = int(idx_msg.text) if idx_msg and idx_msg.text.isdigit() else 1
-    except Exception:
-        start_idx = 1
-
-    await bot.send_message(message.chat.id, "📝 Send batch name (or 'no'):")
-    try:
-        batch_msg = await bot.listen(chat_id=message.chat.id, timeout=60)
-        batch_name = batch_msg.text if batch_msg and batch_msg.text else "Batch"
-    except Exception:
-        batch_name = "Batch"
-
-    await bot.send_message(message.chat.id, "🎬 Enter video quality (e.g. 360 or 720) or 'no':")
-    try:
-        q_msg = await bot.listen(chat_id=message.chat.id, timeout=60)
-        quality = q_msg.text if q_msg and q_msg.text else "720"
-    except Exception:
-        quality = "720"
-
-    await bot.send_message(message.chat.id, "💬 Enter caption (or 'no'):")
-    try:
-        cap_msg = await bot.listen(chat_id=message.chat.id, timeout=120)
-        caption_text = cap_msg.text if cap_msg and cap_msg.text else ""
-    except Exception:
-        caption_text = ""
-
-    await bot.send_message(message.chat.id, "🖼 Send thumbnail URL or 'no':")
-    try:
-        t_msg = await bot.listen(chat_id=message.chat.id, timeout=120)
-        thumb_input = t_msg.text if t_msg and t_msg.text else "no"
-    except Exception:
-        thumb_input = "no"
-
-    thumbnail_local = None
-    if thumb_input and thumb_input.lower() != "no" and thumb_input.startswith("http"):
-        try:
-            # try to wget thumbnail
-            tnpath = os.path.join(DOWNLOAD_DIR, "thumb.jpg")
-            cmd = f"wget -q -O {shlex.quote(tnpath)} {shlex.quote(thumb_input)}"
-            rc, out, err = await run_subprocess(cmd, timeout=60)
-            if rc == 0 and os.path.exists(tnpath):
-                thumbnail_local = tnpath
-        except Exception as e:
-            logging.warning("Thumb fetch failed: %s", e)
-
-    # Start processing links
-    success = 0
-    failed = 0
-
-    for idx, line in enumerate(lines[start_idx - 1 : ], start=start_idx):
-        # each line may have title and url; try to extract
-        title, url = None, None
-        m = re.search(r'(https?://\S+)', line)
-        if m:
-            url = m.group(1).rstrip(" ,;")
-            title = line.replace(url, "").strip()
-        else:
-            # if line is just a domain or url without protocol
-            if "." in line:
-                url = "https://" + line.strip()
-                title = ""
-        if not url:
-            await bot.send_message(message.chat.id, f"Skipping invalid line: {line}")
-            failed += 1
-            continue
-
-        clean_title = safe_filename(title or url.split("/")[-1].split("?")[0], max_len=70)
-        base_name = f"{str(idx).zfill(3)}) {clean_title}"
-
-        progress = await bot.send_message(message.chat.id, f"⬇️ Downloading: {clean_title}\n{url}")
-
-        try:
-            # PDF branch
-            if url.lower().endswith(".pdf"):
-                out_pdf = await download_pdf(url, base_name)
-                if out_pdf and os.path.exists(out_pdf) and os.path.getsize(out_pdf) <= PDF_LIMIT_BYTES:
-                    await send_file_to_chat(message.chat.id, out_pdf, caption_text, thumbnail_local)
-                    os.remove(out_pdf)
-                    success += 1
-                    await progress.edit(f"✅ PDF uploaded: {clean_title}")
+                # Determine download strategy
+                if "youtu" in url:
+                    ytf = f"b[height<={raw_text2}][ext=mp4]/bv[height<={raw_text2}][ext=mp4]+ba[ext=m4a]/b[ext=mp4]"
+                    cmd = f'yt-dlp -f "{ytf}" "{url}" -o "{name}.%(ext)s"'
+                elif url.endswith('.pdf'):
+                    cmd = f'yt-dlp -o "{name}.pdf" "{url}"'
                 else:
-                    failed += 1
-                    await progress.edit(f"❌ PDF failed or too large: {clean_title}")
-                await asyncio.sleep(1)
+                    cmd = f'yt-dlp -f "best" "{url}" -o "{name}.%(ext)s"'
+
+                cc = f'**ðŸ“¹ Video #{str(count).zfill(3)}**\n**ðŸ“ Title:** {name1}\n**ðŸ“¦ Batch:** {raw_text0}\n{MR}'
+                cc1 = f'**ðŸ“„ Document #{str(count).zfill(3)}**\n**ðŸ“ Title:** {name1}\n**ðŸ“¦ Batch:** {raw_text0}\n{MR}'
+
+                # Show download progress
+                prog = await m.reply_text(
+                    f"â¬‡ï¸ **Downloading...**\n\n"
+                    f"ðŸ“ **Name:** `{name1}`\n"
+                    f"ðŸ”— **URL:** `{url[:50]}...`\n"
+                    f"ðŸ“Š **Progress:** {count}/{len(links)}"
+                )
+
+                try:
+                    if "drive.google.com" in url:
+                        filename = await helper.download(url, name)
+                        if filename and os.path.exists(filename):
+                            await bot.send_document(chat_id=m.chat.id, document=filename, caption=cc1)
+                            os.remove(filename)
+                            successful_downloads += 1
+                    elif ".pdf" in url:
+                        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                        expected_file = f"{name}.pdf"
+                        if os.path.exists(expected_file):
+                            await bot.send_document(chat_id=m.chat.id, document=expected_file, caption=cc1)
+                            os.remove(expected_file)
+                            successful_downloads += 1
+                    else:
+                        # Video download
+                        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+
+                        # Find downloaded file
+                        possible_extensions = ['.mp4', '.mkv', '.avi', '.webm', '.mov']
+                        filename = None
+                        for ext in possible_extensions:
+                            test_file = f"{name}{ext}"
+                            if os.path.exists(test_file):
+                                filename = test_file
+                                break
+
+                        if filename and os.path.exists(filename):
+                            await helper.send_vid(bot, m, cc, filename, thumb, name, prog)
+                            successful_downloads += 1
+                        else:
+                            failed_downloads += 1
+                            await prog.edit(f"âŒ **Failed:** {name1}")
+                            await asyncio.sleep(2)
+
+                    await prog.delete()
+                    count += 1
+                    time.sleep(1)
+
+                except FloodWait as e:
+                    await m.reply_text(f"âš ï¸ **Rate limited. Waiting {e.x} seconds...**")
+                    time.sleep(e.x)
+                    continue
+                except Exception as download_error:
+                    failed_downloads += 1
+                    await prog.edit(f"âŒ **Error:** {str(download_error)[:100]}")
+                    await asyncio.sleep(3)
+                    continue
+
+            except Exception as e:
+                failed_downloads += 1
+                await m.reply_text(f"âŒ **Processing error:** {str(e)[:200]}")
                 continue
 
-            # Video branch: attempt download
-            got = await download_video(url, base_name)
-            if got and os.path.exists(got) and file_ok(got):
-                await send_file_to_chat(message.chat.id, got, caption_text, thumbnail_local)
-                try:
-                    os.remove(got)
-                except:
-                    pass
-                success += 1
-                await progress.edit(f"✅ Uploaded: {clean_title}")
-            else:
-                failed += 1
-                await progress.edit(f"❌ Failed to download: {clean_title}")
-        except Exception as e:
-            logging.exception("Processing failed for %s: %s", url, e)
-            failed += 1
-            try:
-                await progress.edit(f"❌ Error for {clean_title}: {e}")
-            except:
-                pass
-        finally:
-            await asyncio.sleep(1)
+    except Exception as e:
+        await m.reply_text(f"âŒ **Fatal error:** {str(e)}")
 
-    await bot.send_message(
-        message.chat.id,
-        f"🎉 Done\n✅ Success: {success}\n❌ Failed: {failed}\n📦 Total: {success+failed}"
+    # Final summary
+    summary_text = (
+        f"ðŸŽ‰ **Download Complete!**\n\n"
+        f"âœ… **Successful:** {successful_downloads}\n"
+        f"âŒ **Failed:** {failed_downloads}\n"
+        f"ðŸ“Š **Total:** {successful_downloads + failed_downloads}"
     )
+    await m.reply_text(summary_text)
 
-# ---------- run ----------
 if __name__ == "__main__":
-    print("Starting bot...")
     bot.run()
